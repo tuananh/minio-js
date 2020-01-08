@@ -14,293 +14,213 @@
  * limitations under the License.
  */
 
-import xml2js from 'xml2js'
+import transform from 'camaro'
 import _ from 'lodash'
 import * as errors from './errors.js'
-
-var options = {  // options passed to xml2js parser
-  explicitRoot: false,    // return the root node in the resulting object?
-  ignoreAttrs: true,     // ignore attributes, only create text nodes
-}
-
-var parseXml = (xml) => {
-  var result = null
-  var error = null
-
-  var parser = new xml2js.Parser(options)
-  parser.parseString(xml, function (e, r) {
-    error = e
-    result = r
-  })
-
-  if (error) {
-    throw new Error('XML parse error')
-  }
-  return result
-}
 
 // Parse XML and return information as Javascript types
 
 // parse error XML response
 export function parseError(xml, headerInfo) {
-  var xmlError = {}
-  var xmlobj = parseXml(xml)
-  var message
-  _.each(xmlobj, (n, key) => {
-    if (key === 'Message') {
-      message = xmlobj[key][0]
-      return
-    }
-    xmlError[key.toLowerCase()] = xmlobj[key][0]
-  })
-  var e = new errors.S3Error(message)
-  _.each(xmlError, (value, key) => {
-    e[key] = value
-  })
-  _.each(headerInfo, (value, key) => {
-    e[key] = value
-  })
+  var template = {
+    code: 'Error/Code',
+    message: 'Error/Message',
+    key: 'Error/Key',
+    bucketname: 'Error/BucketName',
+    resource: 'Error/Resource',
+    region: 'Error/Region',
+    requestid: 'Error/RequestId',
+    hostid: 'Error/HostId'
+  }
+  var xmlError = transform(xml, template)
+  var e = new errors.S3Error(xmlError.message)
+  Object.assign(e, xmlError, headerInfo)
   return e
 }
 
 // parse XML response for copy object
 export function parseCopyObject(xml) {
-  var result = {
-    etag: "",
-    lastModified: ""
+  var template = {
+    etag: "translate(CopyObjectResult/ETag, '\"', '')",
+    lastModified: 'CopyObjectResult/LastModified'
   }
-  var xmlobj = parseXml(xml)
-  if (xmlobj.ETag) result.etag = xmlobj.ETag[0].replace(/^"/g, '').replace(/"$/g, '')
-    .replace(/^&quot;/g, '').replace(/&quot;$/g, '')
-    .replace(/^&#34;/g, '').replace(/^&#34;$/g, '')
-  if (xmlobj.LastModified) result.lastModified = new Date(xmlobj.LastModified[0])
-
+  var result = transform(xml, template)
+  if (result.lastModified) {
+    result.lastModified = new Date(result.lastModified)
+  }
   return result
 }
 
 // parse XML response for listing in-progress multipart uploads
 export function parseListMultipart(xml) {
-  var result = {
-    uploads: [],
-    prefixes: [],
-    isTruncated: false
+  var template = {
+    uploads: ['ListMultipartUploadsOutput/Upload', {
+      key: 'Key',
+      uploadId: 'UploadId',
+      initiated: 'Initiated',
+    }],
+    prefixes: ['ListMultipartUploadsOutput/CommonPrefixes/Prefix', {
+      prefix: '.'
+    }],
+    isTruncated: 'boolean(ListMultipartUploadsOutput/IsTruncated = "true")',
+    nextKeyMarker: 'ListMultipartUploadsOutput/NextKeyMarker',
+    nextUploadIdMarker: 'ListMultipartUploadsOutput/NextUploadIdMarker',
   }
-  var xmlobj =  parseXml(xml)
-  if (xmlobj.IsTruncated && xmlobj.IsTruncated[0] === 'true') result.isTruncated = true
-  if (xmlobj.NextKeyMarker) result.nextKeyMarker =  xmlobj.NextKeyMarker[0]
-  if (xmlobj.NextUploadIdMarker) result.nextUploadIdMarker = xmlobj.NextUploadIdMarker[0]
-  if (xmlobj.CommonPrefixes) xmlobj.CommonPrefixes.forEach(prefix => {
-    result.prefixes.push({prefix: prefix[0]})
-  })
-  if (xmlobj.Upload) xmlobj.Upload.forEach(upload => {
-    result.uploads.push({
-      key: upload.Key[0],
-      uploadId: upload.UploadId[0],
-      initiated: new Date(upload.Initiated[0])
-    })
-  })
+  var result = transform(xml, template)
+  // backward compat
+  if (!result.nextKeyMarker) delete result.nextKeyMarker
+  if (!result.nextUploadIdMarker) delete result.nextUploadIdMarker
   return result
 }
 
 // parse XML response to list all the owned buckets
 export function parseListBucket(xml) {
-  var result = []
-  var xmlobj = parseXml(xml)
-  if (xmlobj.Buckets) {
-    if (xmlobj.Buckets[0].Bucket) {
-      xmlobj.Buckets[0].Bucket.forEach(bucket => {
-        var name = bucket.Name[0]
-        var creationDate = new Date(bucket.CreationDate[0])
-        result.push({name, creationDate})
-      })
-    }
+  var template = {
+    buckets: ['ListAllMyBucketsResult/Buckets/Bucket', {
+      name: 'Name',
+      creationDate: 'CreationDate'
+    }]
   }
-  return result
+  var result = transform(xml, template)
+  _.forEach(result.buckets, (b) => {
+    if (b.creationDate) {
+      b.creationDate = new Date(b.creationDate)
+    }
+  })
+  return result.buckets
 }
 
 // parse XML response for bucket notification
 export function parseBucketNotification(xml) {
-  var result = {
-    TopicConfiguration  : [],
-    QueueConfiguration  : [],
-    CloudFunctionConfiguration : [],
+  const filterRuleTemplate = ['S3Key/FilterRule', {
+    Name: 'Name',
+    Value: 'Value'
+  }]
+  var template = {
+    TopicConfiguration  : ['NotificationConfiguration/TopicConfiguration', {
+      Id: 'Id',
+      Topic: 'Topic',
+      Event: 'Event',
+      Filter: filterRuleTemplate
+    }],
+    QueueConfiguration  : ['NotificationConfiguration/QueueConfiguration', {
+      Id: 'Id',
+      Queue: 'Queue',
+      Event: 'Event',
+      Filter: filterRuleTemplate
+    }],
+    CloudFunctionConfiguration : ['NotificationConfiguration/CloudFunctionConfiguration', {
+      Id: 'Id',
+      CloudFunction: 'CloudFunction',
+      Event: 'Event',
+      Filter: filterRuleTemplate
+    }]
   }
-  // Parse the events list
-  var genEvents = function(events) {
-    var result = []
-    if (events) {
-      events.forEach(s3event => {
-        result.push(s3event)
-      })
-    }
-    return result
-  }
-  // Parse all filter rules
-  var genFilterRules = function(filters) {
-    var result = []
-    if (filters && filters[0].S3Key && filters[0].S3Key[0].FilterRule) {
-      filters[0].S3Key[0].FilterRule.forEach(rule => {
-        var Name = rule.Name[0]
-        var Value = rule.Value[0]
-        result.push({Name, Value})
-      })
-    }
-    return result
-  }
-
-  var xmlobj = parseXml(xml)
-
-  // Parse all topic configurations in the xml
-  if (xmlobj.TopicConfiguration) {
-    xmlobj.TopicConfiguration.forEach(config => {
-      var Id = config.Id[0]
-      var Topic = config.Topic[0]
-      var Event = genEvents(config.Event)
-      var Filter = genFilterRules(config.Filter)
-      result.TopicConfiguration.push({ Id, Topic, Event, Filter})
-    })
-  }
-  // Parse all topic configurations in the xml
-  if (xmlobj.QueueConfiguration) {
-    xmlobj.QueueConfiguration.forEach(config => {
-      var Id = config.Id[0]
-      var Queue = config.Queue[0]
-      var Event = genEvents(config.Event)
-      var Filter = genFilterRules(config.Filter)
-      result.QueueConfiguration.push({ Id, Queue, Event, Filter})
-    })
-  }
-  // Parse all QueueConfiguration arrays
-  if (xmlobj.CloudFunctionConfiguration) {
-    xmlobj.CloudFunctionConfiguration.forEach(config => {
-      var Id = config.Id[0]
-      var CloudFunction = config.CloudFunction[0]
-      var Event = genEvents(config.Event)
-      var Filter = genFilterRules(config.Filter)
-      result.CloudFunctionConfiguration.push({ Id, CloudFunction, Event, Filter})
-    })
-  }
-
+  var result = transform(xml, template)
   return result
 }
 
 // parse XML response for bucket region
 export function parseBucketRegion(xml) {
-  return parseXml(xml)
+  var result = transform(xml, { region: 'LocationConstraint'})
+  return result.region
 }
 
 // parse XML response for list parts of an in progress multipart upload
 export function parseListParts(xml) {
-  var xmlobj = parseXml(xml)
-  var result = {
-    isTruncated: false,
-    parts: [],
-    marker: undefined
+  var template = {
+    isTruncated: 'boolean(ListPartsOutput/IsTruncated = "true")',
+    parts: ['ListPartsOutput/Part', {
+      part: 'PartNumber',
+      lastModified: 'LastModified',
+      etag: "translate(ETag, '\"', '')"
+    }],
+    marker: 'ListPartsOutput/NextPartNumberMarker'
   }
-  if (xmlobj.IsTruncated && xmlobj.IsTruncated[0] === 'true') result.isTruncated = true
-  if (xmlobj.NextPartNumberMarker) result.marker = +xmlobj.NextPartNumberMarker[0]
-  if (xmlobj.Part) {
-    xmlobj.Part.forEach(p => {
-      var part = +p.PartNumber[0]
-      var lastModified = new Date(p.LastModified[0])
-      var etag = p.ETag[0].replace(/^"/g, '').replace(/"$/g, '')
-        .replace(/^&quot;/g, '').replace(/&quot;$/g, '')
-        .replace(/^&#34;/g, '').replace(/^&#34;$/g, '')
-      result.parts.push({part, lastModified, etag})
-    })
-  }
+  var result = transform(xml, template)
+  if (!result.marker) delete result.marker
+  _.forEach(result.parts, p => {
+    if (p.lastModified) p.lastModified = new Date(p.lastModified)
+  })
   return result
 }
 
 // parse XML response when a new multipart upload is initiated
 export function parseInitiateMultipart(xml) {
-  var xmlobj = parseXml(xml)
-  if (xmlobj.UploadId) return xmlobj.UploadId[0]
+  var result = transform(xml, {
+    uploadId: 'InitiateMultipartUploadResult/UploadId'
+  })
+  if (result.uploadId) return result.uploadId
   throw new errors.InvalidXMLError('UploadId missing in XML')
 }
 
 // parse XML response when a multipart upload is completed
 export function parseCompleteMultipart(xml) {
-  var xmlobj = parseXml(xml)
-  if (xmlobj.Location) {
-    var location = xmlobj.Location[0]
-    var bucket = xmlobj.Bucket[0]
-    var key = xmlobj.Key[0]
-    var etag = xmlobj.ETag[0].replace(/^"/g, '').replace(/"$/g, '')
-      .replace(/^&quot;/g, '').replace(/&quot;$/g, '')
-      .replace(/^&#34;/g, '').replace(/^&#34;$/g, '')
+  var template = {
+    errCode: 'Error/Code',
+    errMessage: 'Error/Message',
+    location: 'CompleteMultipartUploadOutput/Location',
+    bucket: 'CompleteMultipartUploadOutput/Bucket',
+    key: 'CompleteMultipartUploadOutput/Key',
+    etag: "translate(CompleteMultipartUploadOutput/ETag, '\"', '')"
+  }
 
-    return {location, bucket, key, etag}
+  var result = transform(xml, template)
+  if (result.errCode && result.errMessage) {
+    return _.pick(result, ['errCode', 'errMessage'])
   }
-  // Complete Multipart can return XML Error after a 200 OK response
-  if (xmlobj.Code && xmlobj.Message) {
-    var errCode = xmlobj.Code[0]
-    var errMessage = xmlobj.Message[0]
-    return {errCode, errMessage}
-  }
+  return result 
 }
 
 // parse XML response for list objects in a bucket
 export function parseListObjects(xml) {
-  var result = {
-    objects: [],
-    isTruncated: false
+  var template = {
+    objects: ['ListBucketResult/Contents', {
+      name: 'Key',
+      lastModified: 'LastModified',
+      etag: "translate(ETag, '\"', '')",
+      size: 'number(Size)'
+    }],
+    isTruncated: 'boolean(ListBucketResult/IsTruncated = "true")',
+    nextMarker: 'ListBucketResult/NextMarker'
   }
-  var nextMarker
-  var xmlobj = parseXml(xml)
-  if (xmlobj.IsTruncated && xmlobj.IsTruncated[0] === 'true') result.isTruncated = true
-  if (xmlobj.Contents) {
-    xmlobj.Contents.forEach(content => {
-      var name = content.Key[0]
-      var lastModified = new Date(content.LastModified[0])
-      var etag = content.ETag[0].replace(/^"/g, '').replace(/"$/g, '')
-        .replace(/^&quot;/g, '').replace(/&quot;$/g, '')
-        .replace(/^&#34;/g, '').replace(/^&#34;$/g, '')
-      var size = +content.Size[0]
-      result.objects.push({name, lastModified, etag, size})
-      nextMarker = name
-    })
+  var result = transform(xml, template)
+  // backward compatible: only add nextMarker prop if exists
+  if (!result.isTruncated) {
+    delete result.nextMarker
   }
-  if (xmlobj.CommonPrefixes) {
-    xmlobj.CommonPrefixes.forEach(commonPrefix => {
-      var prefix = commonPrefix.Prefix[0]
-      var size = 0
-      result.objects.push({prefix, size})
-    })
-  }
-  if (result.isTruncated) {
-    result.nextMarker = xmlobj.NextMarker ? xmlobj.NextMarker[0]: nextMarker
-  }
+  _.forEach(result.objects, o => {
+    if (o.lastModified) {
+      o.lastModified = new Date(o.lastModified)
+    }
+  })
+  // TODO(Anh): implement common prefix
   return result
 }
 
 // parse XML response for list objects v2 in a bucket
 export function parseListObjectsV2(xml) {
-  var result = {
-    objects: [],
-    isTruncated: false
+  var template = {
+    objects: ['ListBucketResult/Contents', {
+      name: 'Key',
+      lastModified: 'LastModified',
+      etag: "translate(ETag, '\"', '')",
+      size: 'number(Size)'
+    }],
+    isTruncated: 'boolean(ListBucketResult/IsTruncated = "true")',
+    nextContinuationToken: 'ListBucketResult/nextContinuationToken'
   }
-  var xmlobj = parseXml(xml)
-  if (xmlobj.IsTruncated && xmlobj.IsTruncated[0] === 'true') result.isTruncated = true
-  if (xmlobj.NextContinuationToken) result.nextContinuationToken = xmlobj.NextContinuationToken[0]
 
-  if (xmlobj.Contents) {
-    xmlobj.Contents.forEach(content => {
-      var name = content.Key[0]
-      var lastModified = new Date(content.LastModified[0])
-      var etag = content.ETag[0].replace(/^"/g, '').replace(/"$/g, '')
-        .replace(/^&quot;/g, '').replace(/&quot;$/g, '')
-        .replace(/^&#34;/g, '').replace(/^&#34;$/g, '')
-      var size = +content.Size[0]
-      result.objects.push({name, lastModified, etag, size})
-    })
+  var result = transform(xml, template)
+  // backward compatible: only add nextContinuationToken if exists
+  if (!result.nextContinuationToken) {
+    delete result.nextContinuationToken
   }
-  if (xmlobj.CommonPrefixes) {
-    xmlobj.CommonPrefixes.forEach(commonPrefix => {
-      var prefix = commonPrefix.Prefix[0]
-      var size = 0
-      result.objects.push({prefix, size})
-    })
-  }
+  _.forEach(result.objects, o => {
+    if (o.lastModified) {
+      o.lastModified = new Date(o.lastModified)
+    }
+  })
+  // TODO(Anh): implement commonPrefix parsing  
   return result
 }
